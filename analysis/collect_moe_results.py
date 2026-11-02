@@ -1,21 +1,4 @@
-"""
-collect_moe_results.py
-======================
-Gathers every run listed in results/moe/registry.csv into paper-ready tables,
-all written inside the repository.
 
-Outputs (under results/moe/):
-    all_metrics_long.csv     one row per (arm, seed, benchmark, metric)
-    summary_mean_sd.csv      mean +/- sd over seeds, every arm x benchmark
-    scaling_table.csv        head parameters vs performance, dense vs routed
-    tables/table_scaling.tex    the headline parameter-control table
-    tables/table_ablation.tex   component ablation at three seeds
-    tables/table_routing.tex    routing-mode comparison
-
-Run:
-    cd /backup/constraint-aware-ddg
-    python analysis/collect_moe_results.py
-"""
 
 from __future__ import annotations
 
