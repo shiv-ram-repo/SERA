@@ -1,29 +1,4 @@
-"""
-moe_capacity_analysis.py
-========================
-Diagnoses *why* the routed head does not beat the small dense head, using the
-runs already on disk. Three analyses, all reading from results/moe/registry.csv:
 
-  1. ACTIVE-capacity scaling. Total head parameters are the wrong x-axis for a
-     sparse model: only top_k experts plus any shared experts run per mutation.
-     Plotting performance against ACTIVE parameters separates "routing helps"
-     from "sparsity limits effective capacity".
-
-  2. Corrected bootstrap. The earlier comparison used the older dense
-     configuration-E runs as reference, but a dense control significantly beat
-     that reference on S2648 and S8754, which means the batches are not
-     comparable. Everything here is compared against dense_512 trained in the
-     same batch through the same code path.
-
-  3. Stratified win/loss. Per-mutation squared-error difference between
-     dense_512 and a routed arm, broken down by |ddG| magnitude, by sign class,
-     and by protein, to show where routing helps and where it costs.
-
-Run:
-    cd /backup/constraint-aware-ddg
-    python analysis/moe_capacity_analysis.py
-    python analysis/moe_capacity_analysis.py --arm lowrank16_r8
-"""
 
 from __future__ import annotations
 
