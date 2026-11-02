@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Environments and secrets
+.venv/
+venv/
+.env
+.env.*
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Generated predictions
+runs/**/eval_noTTA/*.npy
+
+# Experiment tracking and logs
+wandb/
+runs/**/events.out.tfevents*
+*.log
+
+# Local downloaded papers and temporary archives
+1-s2.0-S0141813025038772-main.pdf
+all.zip
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/

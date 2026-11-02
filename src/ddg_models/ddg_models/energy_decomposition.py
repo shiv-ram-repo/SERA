@@ -1,0 +1,197 @@
+"""
+energy_decomposition
+====================
+A structured readout that uses the energy landscapes the backbone already
+computes and currently discards.
+
+ProteinMPNN returns log p(a | structure) at every position and the pipeline
+drops it (`all_mpnn_hid, mpnn_embed, _ = self.encoder(...)`). The ESM adapter
+returns logits alongside representations and only the representations are used.
+Both are per-position distributions over amino acids, so under a Boltzmann
+reading each defines a pseudo-energy
+
+    E_str(a | i) = -log p_MPNN(a | X),
+    E_evo(a | i) = -log p_ESM (a | S),
+
+one structural, one evolutionary. The existing readout ignores both and asks an
+MLP to re-derive from hidden features what these two models state explicitly.
+
+This replaces the single opaque score difference with an explicit decomposition
+
+    ddG = gamma(c) * [s(h)_mut - s(h)_wt]      learned residue score, as before
+        + alpha(c) * [E_str(mut) - E_str(wt)]  structural preference
+        + beta (c) * [E_evo(mut) - E_evo(wt)]  evolutionary preference
+        + pair(h)                              rank-r non-separable term
+        + r(h)                                 whatever none of the above explain
+
+where the mixing coefficients are predicted from a context vector c built from
+the representation together with three scalars that are themselves informative:
+
+    H_str, H_evo   entropy of each landscape at the position, i.e. how tightly
+                   constrained the site is by structure and by evolution
+    frustration    Jensen-Shannon divergence between the two landscapes, high
+                   where structure prefers one residue and evolution kept
+                   another
+
+Initialisation is exact: the gate layer is zero-initialised and gamma is formed
+as 1 + c_gamma, so at step zero alpha = beta = 0, gamma = 1, pair = 0, r = 0 and
+the model computes precisely the standard difference-of-scores readout. Every
+added term has to earn its weight.
+
+The decomposition is also the interpretable output: alpha, beta and the residual
+magnitude say, per mutation, how much of the predicted effect is structural,
+how much evolutionary, and how much neither model accounts for.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ESM-2 places the twenty standard amino acids at these token indices.
+ESM_AA_ORDER = "LAGVSERTIDPKQNFYMHWC"
+ESM_AA_TOKENS = list(range(4, 24))
+# The pipeline's own 21-letter alphabet, which the one-hots index.
+ALPHABET_21 = "ACDEFGHIKLMNPQRSTVWYX"
+
+
+def esm_to_alphabet21_index() -> torch.Tensor:
+    """Token index in the ESM vocabulary for each letter of ALPHABET_21.
+
+    Position 20 ("X") has no ESM token and is mapped to <unk> (3), whose
+    contribution is masked out downstream.
+    """
+    lookup = {a: t for a, t in zip(ESM_AA_ORDER, ESM_AA_TOKENS)}
+    return torch.tensor([lookup.get(a, 3) for a in ALPHABET_21], dtype=torch.long)
+
+
+def _js_divergence(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8):
+    """Jensen-Shannon divergence between two distributions over the last axis."""
+    m = 0.5 * (p + q)
+    kl_pm = (p * ((p + eps).log() - (m + eps).log())).sum(-1)
+    kl_qm = (q * ((q + eps).log() - (m + eps).log())).sum(-1)
+    return 0.5 * (kl_pm + kl_qm)
+
+
+class EnergyDecompositionReadout(nn.Module):
+    """Mixes a learned score with structural and evolutionary pseudo-energies."""
+
+    def __init__(self, input_dim: int, n_aa: int = 21, hidden: int = 128,
+                 use_struct: bool = True, use_evo: bool = True,
+                 use_fluct: bool = True, detach_landscapes: bool = True) -> None:
+        super().__init__()
+        self.n_aa = n_aa
+        self.use_struct, self.use_evo, self.use_fluct = use_struct, use_evo, use_fluct
+        # The landscapes come from the same trunk being fine-tuned; detaching
+        # keeps them as fixed references rather than letting the model reshape
+        # the very quantity it is supposed to be decomposing against.
+        self.detach = detach_landscapes
+
+        # context = representation + (H_str, H_evo, frustration, fluctuation)
+        self.n_ctx = 4
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim + self.n_ctx, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 3),              # alpha, beta, gamma offset
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+        self.residual = nn.Sequential(
+            nn.Linear(input_dim + self.n_ctx, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+
+        self.register_buffer("esm_index", esm_to_alphabet21_index())
+        self.last_terms = None                  # diagnostics for analysis
+
+    # ------------------------------------------------------------------ #
+    def _struct_landscape(self, batch, mut_ids, K):
+        lp = batch.get("mpnn_log_probs", None)
+        if lp is None or not self.use_struct:
+            return None
+        x = lp.detach() if self.detach else lp
+        if x.dim() == 3:
+            x = x[0]                                           # (L, A)
+        # The index must live on the same device as the tensor it indexes:
+        # mut_ids comes off the batch on the CPU while the landscape is on GPU.
+        idx = mut_ids.to(x.device).long().clamp(0, x.shape[0] - 1)
+        out = x.index_select(0, idx)                           # (K, A)
+        if out.shape[-1] < self.n_aa:
+            out = F.pad(out, (0, self.n_aa - out.shape[-1]), value=-1e4)
+        return out[:, : self.n_aa]
+
+    def _evo_landscape(self, batch, mut_ids, K):
+        lg = batch.get("esm_logits", None)
+        if lg is None or not self.use_evo:
+            return None
+        x = lg.detach() if self.detach else lg
+        if x.dim() == 3:
+            x = x[0]                                           # (T, V)
+        # Tokens carry a BOS offset of one, matching the gather elsewhere.
+        idx = (mut_ids.to(x.device).long() + 1).clamp(0, x.shape[0] - 1)
+        rows = x.index_select(0, idx)                          # (K, V)
+        sel = rows.index_select(1, self.esm_index.to(rows.device))
+        return F.log_softmax(sel, dim=-1)                      # (K, 21)
+
+    # ------------------------------------------------------------------ #
+    def forward(self, h, base_ddg, wt_onehot, mut_onehot, batch, mut_ids,
+                pair_term: Optional[torch.Tensor] = None):
+        """h (K,D); base_ddg (K,); one-hots (K,21). Returns corrected ddG."""
+        K = h.shape[0]
+        device, dtype = h.device, h.dtype
+        zeros = torch.zeros(K, device=device, dtype=dtype)
+
+        lp_str = self._struct_landscape(batch, mut_ids, K)
+        lp_evo = self._evo_landscape(batch, mut_ids, K)
+
+        def delta(logp):
+            if logp is None:
+                return zeros, zeros, zeros
+            logp = logp.to(dtype)
+            p = logp.exp()
+            ent = -(p * logp).sum(-1)
+            e = -logp                                           # pseudo-energy
+            d = (e * mut_onehot).sum(-1) - (e * wt_onehot).sum(-1)
+            return d, ent, p.sum(-1) * 0 + 0                    # placeholder
+
+        d_str, h_str, _ = delta(lp_str)
+        d_evo, h_evo, _ = delta(lp_evo)
+
+        if lp_str is not None and lp_evo is not None:
+            frust = _js_divergence(lp_str.exp().to(dtype), lp_evo.exp().to(dtype))
+        else:
+            frust = zeros
+
+        fluct = batch.get("fluctuation", None)
+        if fluct is not None and self.use_fluct:
+            f = fluct.to(device=device, dtype=dtype).reshape(-1)
+            fluct = f[:K] if f.numel() >= K else F.pad(f, (0, K - f.numel()))
+        else:
+            fluct = zeros
+
+        ctx = torch.stack([h_str, h_evo, frust, fluct], dim=-1)   # (K, 4)
+        gin = torch.cat([h, ctx], dim=-1)
+
+        g = self.gate(gin)
+        alpha, beta, gamma = g[:, 0], g[:, 1], 1.0 + g[:, 2]
+        res = self.residual(gin).squeeze(-1)
+
+        ddg = gamma * base_ddg + alpha * d_str + beta * d_evo + res
+        if pair_term is not None:
+            ddg = ddg + pair_term
+
+        self.last_terms = dict(
+            alpha=alpha.detach(), beta=beta.detach(), gamma=gamma.detach(),
+            d_str=d_str.detach(), d_evo=d_evo.detach(), residual=res.detach(),
+            entropy_str=h_str.detach(), entropy_evo=h_evo.detach(),
+            frustration=frust.detach(), fluctuation=fluct.detach(),
+            base=base_ddg.detach(),
+        )
+        return ddg
