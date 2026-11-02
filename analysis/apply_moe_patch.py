@@ -1,22 +1,4 @@
-"""
-apply_moe_patch.py
-==================
-Wires the sparse Mixture-of-Experts readout (`ddg_models/moe_head.py`) into the
-existing pipeline. Idempotent: re-running it is a no-op, and it works whether or
-not the SAM / permanent-feature patches have already been applied, because every
-anchor it keys on is present in all those variants.
 
-Four files are touched, each with a small, local edit:
-
-  src/ddg_models/ddg_models/mlp.py           MoE fields added to MLPConfig
-  src/ddg_models/ddg_models/multimodal_ddg.py  build MoEReadout instead of MLP
-  src/ddg_train/ddg_train/train.py           TrainConfig fields, build_model
-                                             plumbing, auxiliary-loss term
-  src/ddg_train/ddg_train/evaluate.py        MoE args so checkpoints load
-
-Run from the repo root:
-    python analysis/apply_moe_patch.py
-"""
 
 from __future__ import annotations
 
